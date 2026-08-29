@@ -1,0 +1,45 @@
+{
+  "summary": "Full backend + frontend verification of Scrolic (duitscroll) preview. Backend: 13/13 pytest cases pass (feed, energy-packages, cTrader config isConfigured=true, Mayar config isConfigured=true, email/password auth register+login+wrong-password+validation+consent-enforcement, password-reset request, persistence via /api/auth/login, and Tanya AI /api/_llm/economic-event returning a valid non-asterisk answer via openai/gpt-5.4). Frontend: the login modal on the preview URL renders the NEW AuthModal.tsx exactly as expected (header 'Masuk ke Scrolic' + cTrader badge, 'Scroll - Trade - Earn' tagline, T&C consent checkbox with /terms and /privacy-policy links, Email input, Password input minlength=8, green 'Masuk / Daftar dengan Email' button, 'Lupa Password?' link). NO old-version artifacts found: zero occurrences of 'Lanjutkan dengan Google', no 'ATAU MASUKKAN EMAIL GOOGLE' divider, no 'Masuk / Daftar Akun' button - neither in the rendered DOM nor anywhere in /app/frontend source or build artifacts. Live registration through the modal succeeded (POST /api/auth/password -> 200, modal closed, user logged into feed). Lupa Password toggle renders reset view ('Email akun' + 'Kirim Link Reset Password') and returns via 'Kembali ke login'.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/feed?limit=1", "issue": "One transient ReadTimeout (30s) on first run coinciding with a backend hot-reload restart; 3 subsequent curls + rerun returned 200 in <0.25s. Not reproducible (flaky, ~8% single-run)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Navbar (header entry point)", "issue": "The top-right 'Masuk' button still renders a Google 'G' logo SVG and its id is 'btn-nav-google-login' - leftover branding from the removed Google auth flow. Users clicking it expect Google sign-in but get the email/password modal; this legacy Google iconography is likely what reinforces the user's 'old Google login' perception.", "selector": "#btn-nav-google-login", "priority": "MEDIUM"},
+      {"component": "AuthModal", "issue": "Legacy element ids remain from the Google variant: email field is id='input-google-email'. Rename to reflect email/password auth.", "selector": "#input-google-email", "priority": "LOW"},
+      {"component": "AuthModal / whole app", "issue": "No data-testid attributes anywhere in /app/frontend/src (0 matches). Tests had to rely on legacy ids and visible text, which is brittle.", "selector": "n/a", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [
+      {"flow": "Consent gate", "issue": "Requirement stated that submitting without checking the T&C box should surface an error about 'persetujuan Terms & Conditions'. In practice the submit button is rendered disabled={!legalConsent}, so the error branch in hasLegalConsent() is unreachable from the UI. Enforcement works (cannot submit), but no explanatory message is ever shown - user gets a dead-looking button with no reason why.", "affected_selectors": ["#btn-submit-email-login", "#input-legal-consent"]}
+    ],
+    "design_issues": [
+      {"screen": "AuthModal", "issues": ["Consent checkbox label and legal footnote use text-[10px]/text-[11px] neutral-400 on #07130c - very small and low contrast (the 'Enkripsi 256-bit' line in emerald-500/70 is the weakest); consider >=12px and lighter neutral for accessibility."]},
+      {"screen": "Feed (desktop 1920px)", "issues": ["Mobile-first single narrow column centred with large empty gutters on desktop; acceptable for a PWA but no desktop layout adaptation."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Replace the Google 'G' SVG icon on the header 'Masuk' button (Navbar.tsx L136-164) with a neutral/email icon and rename id 'btn-nav-google-login' -> 'btn-nav-login'.",
+    "Show the consent error (or a helper hint) instead of only disabling #btn-submit-email-login, so the user understands why submit is blocked.",
+    "Add data-testid attributes to AuthModal fields/buttons and the Navbar login button.",
+    "Production mismatch RCA: the OLD modal does not exist in /app source, public/sw.js does no fetch caching, and there is no stale dist/build folder. The old bundle is therefore coming from the previously deployed production artifact or CDN cache - re-deploy the current build and hard-invalidate the CDN; no source change is required for the reported bug.",
+    "Optional hardening: frontend makes 78 relative fetch('/api/...') calls and never references REACT_APP_BACKEND_URL. This only works while frontend and API share an origin; if deploy ever splits origins, login and every API call break silently."
+  ],
+  "critical_code_review_comments": [
+    "AuthModal.tsx L97 and 78 other call sites use relative '/api/...' fetches instead of process.env/import.meta.env REACT_APP_BACKEND_URL - violates env-var routing guideline and is a real deploy-fragility risk.",
+    "AuthModal 'Masuk / Daftar dengan Email' is a combined login+register endpoint (/api/auth/password): a typo'd email silently creates a brand-new account instead of erroring. Consider explicit register/login modes or a confirmation step.",
+    "backend/server.py is 3057 lines - exceeds the 700-line guideline; split auth/LLM/cTrader/payments routers into modules.",
+    "The review request referenced POST /api/auth/login-email, but the implemented endpoint is POST /api/auth/password - keep docs/spec in sync."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100%", "frontend": "100% (all required modal assertions passed)"},
+  "seed_data_creation": "Created throwaway accounts via POST /api/auth/password: test_qa_<ts>@scrolic.com (pytest) and uitest1787987469@scrolic.com (UI flow), password 'Passw0rd!Scrolic'. Also short_<ts>/noconsent_<ts> attempts were rejected (no records).",
+  "test_credentials": "/app/memory/test_credentials.md does NOT exist - no pre-seeded creds. Usable account created during testing: uitest1787987469@scrolic.com / Passw0rd!Scrolic",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend regression suite is at /app/backend/tests/backend_test.py (13 tests, run with `cd /app/backend && python -m pytest tests/backend_test.py -v -p no:randomly`). AuthModal has no data-testid; use ids #input-legal-consent, #input-google-email, #input-manual-password, #btn-submit-email-login and header #btn-nav-google-login. Submit is disabled until the consent checkbox is checked. Auth endpoint is /api/auth/password (combined login+register), not /api/auth/login-email. Feed is empty (total_count=0) in this DB.",
+  "rca_of_the_issue": "The reported 'old Google login modal' is NOT present in the current codebase: grep for 'Lanjutkan dengan Google' / 'ATAU MASUKKAN EMAIL' returns zero matches across /app/frontend (source, public, no dist/build present), and the live preview DOM renders only the new email+password AuthModal. public/sw.js registers a service worker but implements no fetch/cache handler, so client-side SW caching is ruled out. Conclusion: production is serving a stale previously-built bundle / CDN-cached asset. Fix = redeploy current source and invalidate the CDN; preview is already correct. Secondary contributor to the user's perception: the header 'Masuk' button still shows a Google G icon (id btn-nav-google-login), making the entry point look like the old Google flow."
+}

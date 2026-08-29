@@ -1,0 +1,48 @@
+{
+  "summary": "Re-verified the Navbar/AuthModal id-rename fixes plus full backend regression. Backend: 13/13 pytest pass (feed, energy-packages, cTrader isConfigured=true, Mayar isConfigured=true, /api/auth/password register+login+wrong-password+short-password+invalid-email+no-consent, password-reset request, persistence via /api/auth/login, and /api/_llm/economic-event returning a valid answer via openai/gpt-5.4). Frontend: FIRST RUN FAILED - the live preview was still serving the OLD bundle (header 'Masuk' button rendered the Google 'G' with id btn-nav-google-login; data-testid btn-nav-login absent) even though /app/frontend/src was already fixed. Root cause found: vite.config.ts sets hmr:false and watch:null, which disables Vite's file watcher, so the dev server keeps serving the module transform it compiled at process start and NEVER picks up source edits (curl of http://localhost:3000/src/components/Navbar.tsx returned the old btn-nav-google-login JSX while the on-disk file had 0 occurrences). After `supervisorctl restart frontend` every requested assertion passed: header button has id/data-testid btn-nav-login with the lucide LogIn icon, zero Google brand-color paths, and 0 DOM occurrences of btn-nav-google-login / input-google-email / input-manual-password / 'Lanjutkan dengan Google' / 'ATAU MASUKKAN EMAIL GOOGLE'. Modal renders the new form (title 'Masuk ke Scrolic' + cTrader badge, T&C checkbox #input-legal-consent, #input-email [data-testid input-auth-email], #input-password [data-testid input-auth-password], #btn-submit-email-login [data-testid btn-auth-submit], 'Masuk / Daftar dengan Email', 'Lupa Password?'). Submit is disabled before consent and enabled after. Live registration with uitest1787987895@scrolic.com succeeded: POST /api/auth/password -> 200, modal closed, header login button replaced by the logged-in navbar (energy pill, notifications, 'Posisi Saya'). Zero console errors, zero error elements.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Preview serving stale code (THE user-reported 'old Google login modal' bug)",
+        "issue": "vite.config.ts server config has `hmr: false` and `watch: null`. With the watcher disabled Vite never invalidates its module graph, so the dev server serves whatever it transformed at process start. Any subsequent edit to Navbar.tsx/AuthModal.tsx is invisible in the preview until the frontend process is manually restarted - reproduced directly: on-disk Navbar.tsx had 0 'btn-nav-google-login' while both http://localhost:3000/src/components/Navbar.tsx and the public preview URL still returned the old JSX with id 'btn-nav-google-login'. This fully explains why the user kept seeing the old login UI after fixes were applied. Recommended fix: remove `watch: null` (and re-enable hmr, or at minimum keep the watcher so full-reload invalidation works); until then every source change requires `sudo supervisorctl restart frontend`.",
+        "affected_selectors": ["[data-testid=\"btn-nav-login\"]", "#btn-nav-google-login"]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "AuthModal",
+        "issues": ["Consent label / legal footnote still text-[10px]-text-[11px] neutral-400 on #07130c; the emerald-500/70 'Enkripsi 256-bit' line is the lowest-contrast text on the modal (carried over from iteration_1, unfixed)."]
+      },
+      {
+        "screen": "AuthModal - consent gate",
+        "issues": ["Submit stays disabled with no visible hint when T&C is unchecked, so hasLegalConsent()'s error message is still unreachable from the UI (carried over from iteration_1, unfixed)."]
+      }
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "CRITICAL: fix /app/frontend/vite.config.ts - `watch: null` + `hmr: false` disables the file watcher and makes the preview serve stale modules forever. This is the actual root cause of the user's 'production/preview shows the OLD login modal' complaint, not the source code. Restore the watcher (and preferably HMR), then verify a live edit reflects without a restart.",
+    "Until that config is fixed, always run `sudo supervisorctl restart frontend` after frontend edits, and re-deploy/CDN-invalidate production so the new bundle ships.",
+    "Optional (carried over): show a consent hint instead of only disabling #btn-submit-email-login; bump modal legal/footnote font size for contrast.",
+    "Optional (carried over): 78 relative fetch('/api/...') calls never use REACT_APP_BACKEND_URL - fragile if origins ever split."
+  ],
+  "critical_code_review_comments": [
+    "vite.config.ts: `watch: null` silently breaks dev-server invalidation - this is a functional defect in the preview pipeline, not a perf tweak. Remove it.",
+    "AuthModal.tsx L97 (and 78 other sites) use relative '/api/...' instead of the REACT_APP_BACKEND_URL env var - violates the env-var routing guideline.",
+    "/api/auth/password is a combined login+register: a typo'd email silently creates a new account with no confirmation step.",
+    "backend/server.py is ~3057 lines - exceeds the 700-line guideline; split auth/LLM/cTrader/payments routers."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (13/13)", "frontend": "100% after frontend restart; 0% before restart because the dev server served a stale bundle"},
+  "seed_data_creation": "pytest created test_qa_<ts>@scrolic.com; UI flow created uitest1787987895@scrolic.com / Passw0rd!Scrolic via POST /api/auth/password.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "/app/memory/test_credentials.md present and accurate: uitest1787987469@scrolic.com / Passw0rd!Scrolic. New account also valid: uitest1787987895@scrolic.com / Passw0rd!Scrolic",
+  "context_for_next_testing_agent": "Run backend suite with `cd /app/backend && python -m pytest tests/backend_test.py -v -p no:randomly` (13 tests, ~5s). IMPORTANT: the Vite dev server does NOT hot-reload (watch:null in vite.config.ts) - ALWAYS `sudo supervisorctl restart frontend` and wait ~12s before UI testing, otherwise you will test stale code. Verify served code matches disk with `curl -s http://localhost:3000/src/components/<File>.tsx`. Selectors: header [data-testid=btn-nav-login]; modal #input-legal-consent, [data-testid=input-auth-email], [data-testid=input-auth-password], [data-testid=btn-auth-submit]. Note page.get_by_text('Masuk ke Scrolic', exact=True) does not match (the h2 has nested spans) - use non-exact text or the input testids to detect the modal. Feed is empty (total_count=0) in this DB.",
+  "rca_of_the_issue": "The user's 'old Google login modal' is a stale-serving problem, not a source problem. /app/frontend/src has zero occurrences of any Google-auth artifact, yet the Vite dev server (vite.config.ts: server.watch = null, server.hmr = false) never invalidates its transform cache, so it returned the pre-edit Navbar.tsx module (containing id='btn-nav-google-login' and the Google G SVG) from both localhost:3000 and the public preview URL. Verified by diffing curl output against the on-disk file (disk: 0 matches; served: 1 match). A single `supervisorctl restart frontend` made the corrected Navbar/AuthModal appear immediately and every acceptance criterion passed. Fix the vite watch config and redeploy/CDN-invalidate production."
+}

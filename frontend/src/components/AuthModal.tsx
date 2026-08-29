@@ -239,7 +239,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <div className="relative">
               <Mail className="w-4 h-4 text-neutral-400 absolute left-3 top-3" />
               <input
-                id="input-google-email"
+                id="input-email"
+                data-testid="input-auth-email"
                 type="email"
                 required
                 value={emailInput}
@@ -258,7 +259,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               Password
             </label>
             <input
-              id="input-manual-password"
+              id="input-password"
+              data-testid="input-auth-password"
               type="password"
               required
               minLength={8}
@@ -274,6 +276,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
           <button
             id="btn-submit-email-login"
+            data-testid="btn-auth-submit"
             type="submit"
             disabled={isSubmitting || !legalConsent}
             className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-extrabold text-xs transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-50 cursor-pointer flex items-center justify-center gap-2"

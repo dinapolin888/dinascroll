@@ -16,8 +16,13 @@ export default defineConfig(() => {
       host: '0.0.0.0',
       port: 3000,
       strictPort: true,
-      hmr: false,
-      watch: null,
+      hmr: {
+        clientPort: 443,
+      },
+      watch: {
+        usePolling: true,
+        interval: 1000,
+      },
       // Local dev proxy: forward /api/* and /socket.io/* to the FastAPI backend on :8001.
       // When accessed via the Emergent ingress URL, ingress already routes /api/*
       // to :8001 externally; this proxy makes localhost:3000 work in isolation too.
