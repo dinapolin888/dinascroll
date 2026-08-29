@@ -258,8 +258,17 @@ async def on_startup():
 
     live_trading_service.start(2.5)
     await ctrader_client.start()
+    # Boot the debounced Mongo writer AFTER init_db but BEFORE the auth burst.
+    try:
+        from backend.mongo_writer import get_mongo_writer
+    except ImportError:
+        from mongo_writer import get_mongo_writer
+    _mongo_writer = get_mongo_writer(db_store)
+    await _mongo_writer.start()
     token_refresh_supervisor.start()
-    # Restore every previously authorized broker account after a process restart.
+
+    # Restore every previously authorised broker account via the rate-limited shard scheduler.
+    restore_tasks: List[Dict[str, Any]] = []
     for stored_user in list(db_store.users):
         if not stored_user.get("ctrader_connected") or not stored_user.get("ctrader_access_token"):
             continue
@@ -272,19 +281,32 @@ async def on_startup():
                 account_type != "DEMO" and account_is_live is not False
             ) == (CTRADER_ENV == "live")
             if account_id and environment_matches:
-                authenticated = await ctrader_client.authenticate_account(
-                    account_id,
-                    stored_user["ctrader_access_token"],
-                    user_id
-                )
-                if authenticated:
-                    logger.info(f"[cTrader.Restore] Account {account_id} restored for {user_id}; reconcile requested.")
+                restore_tasks.append({
+                    "account_id": account_id,
+                    "access_token": stored_user["ctrader_access_token"],
+                    "user_id": user_id,
+                })
+    if restore_tasks and hasattr(ctrader_client, "authenticate_all_accounts_ratelimited"):
+        asyncio.create_task(ctrader_client.authenticate_all_accounts_ratelimited(restore_tasks))
+        logger.info(f"[cTrader.Restore] Scheduled {len(restore_tasks)} account re-auth via rate-limited shard scheduler.")
+    elif restore_tasks:
+        # Single-shard fallback (should not happen once ShardManager is active).
+        for t in restore_tasks:
+            await ctrader_client.authenticate_account(t["account_id"], t["access_token"], t["user_id"])
     logger.info(f"[scrolic.backend] Single-runtime FastAPI backend running. Mayar API Key configured: {bool(get_mayar_api_key())}")
 
 @fastapi_app.on_event("shutdown")
 async def on_shutdown():
     live_trading_service.stop()
     await ctrader_client.stop()
+    try:
+        from backend.mongo_writer import get_mongo_writer
+    except ImportError:
+        from mongo_writer import get_mongo_writer
+    try:
+        await get_mongo_writer(db_store).stop()
+    except Exception:
+        pass
     token_refresh_supervisor.stop()
 
 def get_current_user_id(request: Request, x_session_user_id: Optional[str] = Header(None)) -> Optional[str]:
@@ -624,6 +646,7 @@ def _distribute_topup_affiliate_commissions(user_id: str, energy_amount: int, re
 @fastapi_app.post("/api/mayar/webhook")
 async def mayar_webhook(request: Request):
     webhook_secret = get_mayar_webhook_secret()
+    auth_header = request.headers.get("authorization", "") or request.headers.get("x-mayar-signature", "")
     if webhook_secret and webhook_secret not in auth_header:
         logger.warning("[Mayar Webhook] Received webhook with invalid authorization header")
 
@@ -1450,6 +1473,51 @@ async def ctrader_diagnostics():
         "success": True,
         "diagnostics": ctrader_client.get_diagnostics(),
         "alarms": ctrader_client.get_observability_alarms()
+    }
+
+@fastapi_app.get("/api/ctrader/shards/status")
+async def ctrader_shards_status():
+    """Per-shard health/metrics for the cTrader ShardManager."""
+    if hasattr(ctrader_client, "get_shards_summary"):
+        shards = ctrader_client.get_shards_summary()
+        scheduler = ctrader_client.scheduler_snapshot() if hasattr(ctrader_client, "scheduler_snapshot") else {}
+        owned = ctrader_client.owned_shards() if hasattr(ctrader_client, "owned_shards") else []
+        try:
+            from backend.mongo_writer import get_mongo_writer
+        except ImportError:
+            from mongo_writer import get_mongo_writer
+        writer_metrics = {}
+        try:
+            writer_metrics = get_mongo_writer(db_store).metrics()
+        except Exception:
+            pass
+        return {
+            "success": True,
+            "shardCount": len(shards),
+            "ownedShards": owned,
+            "shards": shards,
+            "authScheduler": scheduler,
+            "mongoWriter": writer_metrics,
+            "timestamp": int(time.time() * 1000),
+        }
+    diag = ctrader_client.get_diagnostics()
+    return {
+        "success": True,
+        "shardCount": 1,
+        "ownedShards": [0],
+        "shards": [{
+            "shardId": 0,
+            "state": diag.get("state"),
+            "connected": diag.get("is_broker_connected", False),
+            "environment": diag.get("environment"),
+            "host": diag.get("host"),
+            "port": diag.get("port"),
+            "accountsTotal": len(ctrader_client.account_states),
+            "accountsAuthenticated": diag.get("authenticated_accounts_count", 0),
+        }],
+        "authScheduler": {},
+        "mongoWriter": {},
+        "timestamp": int(time.time() * 1000),
     }
 
 @fastapi_app.get("/api/ctrader/observability/dashboard")

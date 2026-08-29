@@ -31,8 +31,7 @@ from backend.ctrader_config import (
     get_ctrader_env,
     get_active_endpoint,
     SPOTWARE_ENDPOINTS,
-    mask_credential,
-    SPOTWARE_ENDPOINTS
+    mask_credential
 )
 
 try:
@@ -85,7 +84,10 @@ PROTO_OA_GET_POSITION_UNREALIZED_PNL_REQ = 2187
 PROTO_OA_GET_POSITION_UNREALIZED_PNL_RES = 2188
 
 class CTraderClient:
-    def __init__(self):
+    def __init__(self, shard_id: int = 0, shard_count: int = 1):
+        self.shard_id: int = int(shard_id)
+        self.shard_count: int = max(1, int(shard_count))
+        self._log_prefix: str = f"cTrader.Client.Shard{self.shard_id}" if self.shard_count > 1 else "cTrader.Client"
         self.state: CTraderConnectionState = CTraderConnectionState.DISCONNECTED
         self._running: bool = False
         self._main_task: Optional[asyncio.Task] = None
@@ -851,19 +853,28 @@ class CTraderClient:
 
     async def _heartbeat_loop(self):
         """Sends ProtoHeartbeatEvent (51) every 20s and checks for staleness."""
+        consecutive_stale = 0
         while self._running and self.state in (CTraderConnectionState.CONNECTED, CTraderConnectionState.AUTHENTICATED):
             try:
                 await asyncio.sleep(self._heartbeat_interval)
-                await self.send_message(PROTO_HEARTBEAT_EVENT, {})
-                
-                # Check for stale response
+
+                # Check staleness BEFORE sending the next heartbeat, so an idle
+                # socket doesn't spuriously flip to DEGRADED between send-and-reply.
                 last_msg_str = self.metrics.get("last_message_at")
                 if last_msg_str:
                     last_msg_dt = datetime.fromisoformat(last_msg_str)
                     age_seconds = (datetime.now(timezone.utc) - last_msg_dt).total_seconds()
                     if age_seconds > self._stale_timeout:
-                        logger.warning(f"[cTrader.Heartbeat] No messages received for {age_seconds:.1f}s. Connection DEGRADED.")
-                        self._set_state(CTraderConnectionState.DEGRADED, error_msg="Heartbeat response timeout")
+                        consecutive_stale += 1
+                        if consecutive_stale >= 2:
+                            logger.warning(f"[cTrader.Heartbeat] No messages received for {age_seconds:.1f}s (x{consecutive_stale}). Connection DEGRADED.")
+                            self._set_state(CTraderConnectionState.DEGRADED, error_msg="Heartbeat response timeout")
+                    else:
+                        consecutive_stale = 0
+                else:
+                    consecutive_stale = 0
+
+                await self.send_message(PROTO_HEARTBEAT_EVENT, {})
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1030,5 +1041,18 @@ class CTraderClient:
             if future and not future.done():
                 future.set_result(payload_data)
 
-# Singleton persistent client instance
-ctrader_client = CTraderClient()
+# Singleton persistent client instance. When CTRADER_SHARD_COUNT>1 this is a
+# ShardManager (facade with N CTraderClient shards), otherwise a single
+# CTraderClient (unchanged behaviour). The public method surface is identical
+# so callers in server.py / ticker.py don't need to know which mode is active.
+import os as _os_shard
+_SHARD_COUNT = max(1, int(_os_shard.environ.get("CTRADER_SHARD_COUNT", "1") or "1"))
+if _SHARD_COUNT > 1:
+    try:
+        from backend.shard_manager import ShardManager  # type: ignore
+    except ImportError:
+        from shard_manager import ShardManager  # type: ignore
+    ctrader_client = ShardManager(shard_count=_SHARD_COUNT)
+    logger.info("[cTrader.Client] ShardManager active with %d shards.", _SHARD_COUNT)
+else:
+    ctrader_client = CTraderClient(shard_id=0, shard_count=1)

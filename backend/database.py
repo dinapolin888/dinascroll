@@ -5,7 +5,7 @@ Supports Users, Strategies, Feed Posts, Comments, Notifications, Transactions, P
 import os, sys, logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
@@ -632,7 +632,134 @@ class MemoryStore:
 
 db_store = MemoryStore()
 
+def _ensure_ctrader_indexes():
+    """Create indexes for high-frequency broker collections and shard leases.
+
+    Called at init_db(). Idempotent — safe to call repeatedly."""
+    if not db_store.is_mongo_connected or db_store.db is None:
+        return
+    try:
+        db_store.db.broker_positions.create_index(
+            [("account_id", 1), ("position_id", 1)], unique=True, background=True, name="broker_positions_account_position_unique"
+        )
+        db_store.db.broker_positions.create_index([("account_id", 1)], background=True, name="broker_positions_account")
+        db_store.db.broker_positions.create_index([("updated_at", -1)], background=True, name="broker_positions_updated_at")
+
+        db_store.db.broker_deals.create_index(
+            [("account_id", 1), ("deal_id", 1)], unique=True, background=True, name="broker_deals_account_deal_unique"
+        )
+        db_store.db.broker_deals.create_index([("account_id", 1)], background=True, name="broker_deals_account")
+
+        db_store.db.account_snapshots.create_index([("account_id", 1)], background=True, name="account_snapshots_account")
+        db_store.db.account_snapshots.create_index([("timestamp", -1)], background=True, name="account_snapshots_timestamp")
+
+        db_store.db.shard_assignments.create_index([("shard_id", 1)], unique=True, background=True, name="shard_assignments_shard_id_unique")
+        db_store.db.shard_assignments.create_index([("holder_instance_id", 1)], background=True, name="shard_assignments_holder")
+        # NOTE: no TTL index — we manage expiry via `lease_expires_at` compare in queries
+        # so heartbeats can update in-place.
+
+        db_store.db.pending_auth.create_index([("shard_id", 1), ("status", 1)], background=True, name="pending_auth_shard_status")
+        db_store.db.pending_auth.create_index([("created_at", 1)], background=True, name="pending_auth_created")
+
+        logger.info("[Database] cTrader broker indexes ensured.")
+    except Exception as e:
+        logger.warning(f"[MongoDB] Index creation warning: {e}")
+
+
+# ---------- Shard assignment lease (crash-safety across processes) ----------
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+def _claim_shard(self, shard_id: int, instance_id: str, ttl_seconds: int) -> bool:
+    """Atomic find_one_and_update: claim shard if unowned or expired.
+
+    Returns True if this instance now holds the lease.
+    """
+    if not self.is_mongo_connected or self.db is None:
+        return True  # single-process fallback: pretend claim succeeded
+    try:
+        now = _now_utc()
+        expires = now + timedelta(seconds=int(ttl_seconds))
+        result = self.db.shard_assignments.find_one_and_update(
+            {
+                "shard_id": int(shard_id),
+                "$or": [
+                    {"holder_instance_id": instance_id},
+                    {"holder_instance_id": {"$exists": False}},
+                    {"lease_expires_at": {"$lt": now}}
+                ]
+            },
+            {
+                "$set": {
+                    "shard_id": int(shard_id),
+                    "holder_instance_id": instance_id,
+                    "lease_expires_at": expires,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now}
+            },
+            upsert=True,
+            return_document=True,
+        )
+        return bool(result and result.get("holder_instance_id") == instance_id)
+    except Exception as e:
+        logger.warning(f"[MongoDB] claim_shard error (shard={shard_id}): {e}")
+        return False
+
+def _heartbeat_shard(self, shard_id: int, instance_id: str, ttl_seconds: int) -> bool:
+    """Refresh lease expiry only if this instance still owns it."""
+    if not self.is_mongo_connected or self.db is None:
+        return True
+    try:
+        now = _now_utc()
+        expires = now + timedelta(seconds=int(ttl_seconds))
+        result = self.db.shard_assignments.find_one_and_update(
+            {"shard_id": int(shard_id), "holder_instance_id": instance_id},
+            {"$set": {"lease_expires_at": expires, "updated_at": now}},
+            return_document=True,
+        )
+        return bool(result)
+    except Exception as e:
+        logger.warning(f"[MongoDB] heartbeat_shard error (shard={shard_id}): {e}")
+        return False
+
+def _release_shard(self, shard_id: int, instance_id: str) -> None:
+    if not self.is_mongo_connected or self.db is None:
+        return
+    try:
+        self.db.shard_assignments.delete_one({"shard_id": int(shard_id), "holder_instance_id": instance_id})
+    except Exception as e:
+        logger.warning(f"[MongoDB] release_shard error (shard={shard_id}): {e}")
+
+def _queue_pending_auth(self, account_id, access_token: str, user_id: str, shard_id: int) -> None:
+    """Persist a pending-auth request so the holder process can pick it up.
+
+    Used only when a non-holder process receives an auth request in multi-pod
+    deployments. In the default single-pod setup this queue is unused.
+    """
+    if not self.is_mongo_connected or self.db is None:
+        return
+    try:
+        self.db.pending_auth.insert_one({
+            "account_id": str(account_id),
+            "access_token": access_token,
+            "user_id": user_id,
+            "shard_id": int(shard_id),
+            "status": "pending",
+            "created_at": _now_utc(),
+        })
+    except Exception as e:
+        logger.warning(f"[MongoDB] queue_pending_auth error: {e}")
+
+# Bind lease/queue helpers onto MemoryStore as bound methods.
+MemoryStore.claim_shard = _claim_shard
+MemoryStore.heartbeat_shard = _heartbeat_shard
+MemoryStore.release_shard = _release_shard
+MemoryStore.queue_pending_auth = _queue_pending_auth
+
+
 async def init_db():
     db_store.connect_mongo_if_available()
     if not db_store.is_mongo_connected:
         logger.info("[Database] Initialized Python In-Memory Repository with seeded Scrolic V7 data.")
+    _ensure_ctrader_indexes()

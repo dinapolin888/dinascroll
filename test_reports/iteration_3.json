@@ -1,0 +1,48 @@
+{
+  "summary": "Verified the cTrader ShardManager sharding refactor end-to-end. Added /app/backend/tests/test_ctrader_shards.py (21 tests: shards/status shape, per-shard AUTHENTICATED state + live.ctraderapi.com:5035, authScheduler config 5/10/3/8, mongoWriter flush_interval 0.5s, shard_assignments lease docs, all required Mongo indexes incl. uniqueness, consistent_shard() determinism, legacy diagnostics/health/config endpoints, MongoWriter debounced bulk_write upsert). Re-ran the 13-test iteration_2 regression suite. Total 34/34 pytest tests pass. Frontend regression verified on preview URL: AuthModal opens via btn-nav-login with correct email/password form ('Masuk / Daftar dengan Email' + 'Lupa Password?'), consent gating works, and full email/password login succeeds with 0 failed /api/ calls and 0 console errors.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "internal ctrader_client._heartbeat_loop", "issue": "False DEGRADED flapping: staleness is checked immediately AFTER send_message(heartbeat) without waiting for the reply, so on an idle socket age>stale_timeout every 10s cycle. With 8 shards this now emits 8 WARNING + 16 state transitions every ~10s (100 transitions logged in ~5 min of idle). Recovery is within ms so external state stays AUTHENTICATED, but ShardManager.state momentarily returns DEGRADED (any-shard-degraded rule), which gates ticker.py `state == AUTHENTICATED` work. Fix: evaluate staleness before sending the heartbeat, or add a grace period."},
+      {"endpoint": "/api/ctrader/health", "issue": "Broker block key is `ctrader_broker`, not `broker` as stated in the spec. Non-breaking, but spec/UI contract mismatch worth confirming."},
+      {"endpoint": "backend/database.py pending_auth", "issue": "shard_manager.queue_pending_auth() produces work-queue docs but NO consumer exists anywhere in the codebase. Acceptable for the 1-pod MVP, but if a second replica is added, auths routed to a non-held shard are silently dropped (authenticate_account returns False and nothing ever retries)."},
+      {"endpoint": "backend/mongo_writer.py::_flush_once", "issue": "When Mongo is disconnected all pending positions/deals/snapshots are silently cleared (data loss, no metric increment). Consider an `dropped_events` counter for observability."},
+      {"endpoint": "backend/mongo_writer.py::schedule_*", "issue": "schedule_position/deal/snapshot mutate the pending dicts without the asyncio lock used in _flush_once. Safe today (single event loop, no awaits) but fragile if a thread/executor ever schedules writes."},
+      {"endpoint": "backend/shard_manager.py::record_latency", "issue": "Broadcasts one broker timestamp to every shard, inflating per-shard latency samples 8x. Should route to the owning shard or be removed."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "AuthModal", "issues": ["Last benefit line 'Enkripsi 256-bit & Data Tersimpan Persisten di Database Cloud' is dark green on near-black — clearly lower contrast than the 3 lines above it (likely below WCAG AA)."]},
+      {"screen": "Feed (desktop 1920px)", "issues": ["Content is locked to a ~365px mobile column centered on a 1920px viewport, leaving very large empty gutters. Intentional mobile-first shell, flagged for confirmation only."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_ctrader_shards.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Fix heartbeat staleness check ordering in ctrader_client._heartbeat_loop to stop the 8x/10s false DEGRADED log noise and momentary aggregate DEGRADED state.",
+    "Decide on /api/ctrader/health key naming (`ctrader_broker` vs `broker`) and keep the frontend/docs in sync.",
+    "Add a pending_auth consumer (or document explicitly that multi-pod is not yet supported) before scaling past 1 pod.",
+    "Add a dropped-events counter in MongoWriter instead of silently clearing pending batches when Mongo is down."
+  ],
+  "critical_code_review_comments": [
+    "consistent_shard() is plain modulo (raw % N), not a hash ring — changing CTRADER_SHARD_COUNT remaps nearly every account. Fine while N is fixed at 8, but document it or move to a real ring/jump-hash before N becomes tunable in production.",
+    "ShardManager.metrics does not expose environment/host/port (present in per-shard CTraderClient.metrics); any caller reading ctrader_client.metrics['host'] at the aggregate level will get None.",
+    "backend/server.py is 3124 lines and ctrader_client.py 1049 lines — both well past the 700-line guideline; split routers/services.",
+    "ShardManager.stop() catches `except (asyncio.CancelledError, Exception)` — swallowing CancelledError can mask shutdown cancellation semantics.",
+    "Editing any file under /app/backend (including tests/) triggers a WatchFiles reload that tears down and re-establishes all 8 live cTrader WebSockets; consider uvicorn --reload-exclude for tests/ to avoid needless broker reconnect storms in dev."
+  ],
+  "updated_files": ["/app/backend/tests/test_ctrader_shards.py"],
+  "success_rate": {"backend": "100% (34/34 pytest)", "frontend": "100% (auth modal + login flow)"},
+  "seed_data_creation": "Transient only: one TEST_acct1/TEST_pos1 broker_positions doc created and deleted by the MongoWriter test; backend_test.py registers a timestamped test_qa_*@scrolic.com user (pre-existing behaviour).",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "uitest1787987469@scrolic.com / Passw0rd!Scrolic (valid, login verified in UI)",
+  "context_for_next_testing_agent": "Sharding evidence all verified: 8 CTraderClient shards AUTHENTICATED to live.ctraderapi.com:5035, ownedShards [0..7], leaseHeld true, 8 shard_assignments docs with live heartbeats (updated_at refreshed every 20s, lease_expires_at +60s), all required indexes present and unique where specified, consistent_shard(47601047,8)==7 and 'cTrader-47601047' maps identically, MongoWriter debounce coalesces same-key events and upserts on the unique (account_id,position_id) key. pending_auth is empty (0 users with persisted ctrader tokens in this DB), so live per-account shard auth routing was NOT exercised — retest that when a real cTrader-linked user exists. Note: tests /api/ctrader/shards/status and /api/ctrader/health retry up to 6x because backend hot-reload (triggered by writing files under /app/backend) transiently shows CONNECTING.",
+  "rca_of_the_issue": "The only functional defect found is log-level: _heartbeat_loop sends ProtoHeartbeatEvent then immediately compares metrics['last_message_at'] against _stale_timeout in the same iteration, before the broker reply can be read, so an idle connection always trips the DEGRADED branch and recovers milliseconds later when the reply arrives. Reproduce: idle backend, tail /var/log/supervisor/backend.err.log — 8 'No messages received for 30.0s' warnings and AUTHENTICATED->DEGRADED->AUTHENTICATED pairs every ~10s. Mitigation: check staleness at the top of the loop (before send) or require 2 consecutive stale observations."
+}
