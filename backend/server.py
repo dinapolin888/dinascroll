@@ -60,6 +60,8 @@ def get_public_base_url(request: Optional[Request] = None) -> str:
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4").strip()
 
 try:
     from backend.ctrader_config import (
@@ -1810,7 +1812,7 @@ async def _run_llm(session_id: str, system_message: str, user_text: str, image_b
     if not EMERGENT_LLM_KEY:
         raise RuntimeError("EMERGENT_LLM_KEY not configured")
     from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent  # type: ignore
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system_message).with_model("gemini", GEMINI_MODEL)
+    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system_message).with_model(LLM_PROVIDER, LLM_MODEL)
     file_contents = [ImageContent(image_base64=image_b64)] if image_b64 else None
     msg = UserMessage(text=user_text, file_contents=file_contents) if file_contents else UserMessage(text=user_text)
     return await chat.send_message(msg)
